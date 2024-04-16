@@ -20,6 +20,7 @@ from torch import from_numpy
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.dataloader import default_collate
 
+import random
 
 CAM_NAMES = ["cam0%d" % cam_num for cam_num in (1, 3, 5, 6, 7, 8, 9)]
 SPLITS = {
@@ -173,6 +174,7 @@ class OnceImageLidarDataset(Dataset):
         self._data_root = join(data_root, "data")
         self._frames = self._setup(split)
         self._img_transform = img_transform
+        self.enable_crop = True
         gc.collect()
 
     def _setup(self, split: str) -> torch.Tensor:
@@ -200,6 +202,8 @@ class OnceImageLidarDataset(Dataset):
         self._cam_to_velos = torch.zeros((len(seq_list), len(CAM_NAMES), 4, 4))
         self._cam_intrinsics = torch.zeros((len(seq_list), len(CAM_NAMES), 3, 3))
         self._cam_distortions = torch.zeros((len(seq_list), len(CAM_NAMES), 5))
+        self._boxes_3d = {}  # sequence_id, frame_id           --> boxes_3d
+        self._boxes_2d = {}  # sequence_id, frame_id, cam_name --> boxes_2d
         for sequence_id in seq_list:
             anno_file_path = os.path.join(
                 self._data_root, sequence_id, "{}.json".format(sequence_id)
@@ -217,6 +221,14 @@ class OnceImageLidarDataset(Dataset):
                 # for cam_name in CAM_NAMES:
                 #    frames.append((int(sequence_id), int(frame_id), self._cam_to_idx[cam_name]))
                 frames.append((int(sequence_id), int(frame_id)))
+                if "annos" in frame_anno:  # Fetch boxes_2d and boxes_3d from annos
+                    self._boxes_3d[(sequence_id, frame_id)] = frame_anno["annos"]["boxes_3d"]
+                    for cam_name in CAM_NAMES:
+                        self._boxes_2d[(sequence_id, frame_id, cam_name)] = frame_anno["annos"]["boxes_2d"][cam_name]
+                else: # Empty list if no annos found
+                    self._boxes_3d[(sequence_id, frame_id)] = []
+                    for cam_name in CAM_NAMES:
+                        self._boxes_2d[(sequence_id, frame_id, cam_name)] = []
 
             for cam_name in CAM_NAMES:
                 seq_idx = self._sequence_map[sequence_id]
@@ -252,8 +264,15 @@ class OnceImageLidarDataset(Dataset):
         except:
             print(f"Failed to load image {sequence_id}/{frame_id}/{cam_name}")
             # return self.__getitem__(np.random.randint(0, len(self._frames)))
-        # image = to_pil_image(image)
+
         og_size = image.size
+        random_box_2d = None
+        if self.enable_crop:
+            random_box_2d = self.get_random_box2d(sequence_id, frame_id, cam_name, og_size)
+            image = self.get_image_crop(image, random_box_2d)
+
+        # image = to_pil_image(image)
+
         image = self._img_transform(image)
         new_size = image.shape[1:]
         try:
@@ -279,11 +298,66 @@ class OnceImageLidarDataset(Dataset):
 
         # point_cloud = self._transform_lidar_to_cam(point_cloud, calib)
         # point_cloud = self._remove_points_outside_cam(point_cloud, og_size, new_size, calib)
-        point_cloud = self._transform_lidar_and_remove_points_outside_cam_torch(
-            point_cloud, calib, og_size, new_size
-        )
 
-        return image, point_cloud
+        if self.enable_crop:
+            point_cloud = self._transform_lidar_and_remove_points_outside_cam_torch(
+                point_cloud, calib, og_size, new_size
+            )
+        else:
+            point_cloud = self._transform_lidar_and_remove_points_outside_crop_torch(
+                point_cloud, calib, og_size, new_size, random_box_2d
+            )
+
+        return image, point_cloud if random_box_2d else None
+
+    def get_random_box2d(self, sequence_id, frame_id, cam_name, og_size):
+        w_og, h_og = og_size
+        # The final image is cropped to get it from 16:9 aspect ratio to 9:9
+        left, right = w_og // 2 - h_og // 2, w_og // 2 + h_og // 2
+        top, bottom = 0, h_og
+        # Check if the box is in within the crop
+        is_box_in_crop = lambda box_2d: left <= box_2d[0] <= right and top <= box_2d[1] <= bottom and \
+                                        left <= box_2d[2] <= right and top <= box_2d[3] <= bottom
+        # Check if box is within FOV and within crop
+        is_box_valid = lambda box_2d: all(coord > 0 for coord in box_2d) and is_box_in_crop(box_2d)
+        # Randomly return one of the detections; Return None if no detections found
+        random_box_2d = None
+        for i in range(len(self._boxes_2d[(sequence_id, frame_id, cam_name)])):
+            random_box_2d = random.choice(self._boxes_2d[(sequence_id, frame_id, cam_name)])
+            if is_box_valid(random_box_2d):
+                break
+            else:
+                random_box_2d = None
+        return random_box_2d
+
+    def get_image_crop(self, image, box2d):
+        # Blacks out the image other than the cropped region
+        image_np = np.array(image)
+        xmin, ymin, xmax, ymax = int(box2d[0]), int(box2d[1]), int(box2d[2]), int(box2d[3])
+        masked = np.zeros_like(image_np, dtype=np.uint8)
+        masked[ymin:ymax, xmin:xmax, :] = image_np[ymin:ymax, xmin:xmax, :]
+        return Image.fromarray(masked)
+
+    def _collate_fn(self, batch, ignore_none=True):
+        # There could be images which don't have valid detections;
+        # The dataset returns None for these cases
+        # The following code eliminates these None instances from the batch
+        if ignore_none:
+            len_batch = len(batch)
+            batch = list(filter(lambda x: x is not None, batch))
+            if len_batch > len(batch):
+                print("Removing Nones")
+                db_len = len(self)
+                diff = len_batch - len(batch)
+                while diff != 0:
+                    a = self[np.random.randint(0, db_len)]
+                    if a is None:
+                        continue
+                    batch.append(a)
+                    diff -= 1
+        batched_img = default_collate([elem[0] for elem in batch])
+        batched_pc = [elem[1] for elem in batch]
+        return batched_img, batched_pc
 
     def map_index(self, index):
         sequence_id, frame_id = self._frames[index // len(CAM_NAMES)]
@@ -340,6 +414,73 @@ class OnceImageLidarDataset(Dataset):
             & (points_img[:, 0] < right_border)
             & (0 < points_img[:, 1])
             & (points_img[:, 1] < h_og)
+        )
+
+        # add reflectance
+        points_cam = points_cam[mask]
+        points_cam[:, 3] = points_lidar[mask, 3]
+        # shift from cam coords to KITTI style (x-forward, y-left, z-up)
+        points_cam = points_cam[:, (2, 0, 1, 3)]
+        points_cam[:, 1] = -points_cam[:, 1]
+        points_cam[:, 2] = -points_cam[:, 2]
+        return points_cam.contiguous()
+
+    @staticmethod
+    def _transform_lidar_and_remove_points_outside_crop_torch(
+            points_lidar, calibration, og_size, new_size, random_box_2d
+    ):
+
+        # project to cam coords
+        cam_2_lidar = calibration["cam_to_velo"]
+
+        points_cam = torch.hstack(
+            [
+                points_lidar[:, :3],
+                torch.ones((points_lidar.shape[0], 1), dtype=torch.float32),
+            ]
+        )
+
+        points_cam = torch.matmul(points_cam, torch.linalg.inv(cam_2_lidar).T)
+
+        # discard points behind camera
+        mask = points_cam[:, 2] > 0
+        points_cam = points_cam[mask]
+        points_lidar = points_lidar[mask]
+
+        # project to image coords
+        w_og, h_og = og_size
+        og_short_side = min(w_og, h_og)
+        w_new, h_new = new_size
+        scaling = og_short_side / w_new
+        new_cam_intrinsic, _ = cv2.getOptimalNewCameraMatrix(
+            calibration["cam_intrinsic"].numpy(),
+            calibration["distortion"].numpy(),
+            (w_og, h_og),
+            alpha=0.0,
+        )
+
+        points_img = torch.matmul(points_cam[:, :3], torch.as_tensor(new_cam_intrinsic).T)
+        points_img = points_img / points_img[:, [2]]
+        # w_og // 2 = middle of image
+        # h_og // 2 = half new image width due to wide aspect ratio 16:9 (that is cropped to square 9:9)
+        left_border = w_og // 2 - h_og // 2
+        right_border = w_og // 2 + h_og // 2
+        top_border = 0
+        bottom_border = h_og
+
+        # Update the border to be the crop border
+        if random_box_2d:
+            xmin, ymin, xmax, ymax = int(random_box_2d[0]), int(random_box_2d[1]), int(random_box_2d[2]), int(random_box_2d[3])
+            left_border = max(left_border, xmin)
+            right_border = min(right_border, xmax)
+            top_border = max(top_border, ymin)
+            bottom_border = min(bottom_border, ymax)
+
+        mask = (
+                (left_border < points_img[:, 0])
+                & (points_img[:, 0] < right_border)
+                & (top_border < points_img[:, 1])
+                & (points_img[:, 1] < bottom_border)
         )
 
         # add reflectance
@@ -545,7 +686,7 @@ def build_loader(
         dataset,
         num_workers=num_workers,
         batch_size=batch_size,
-        collate_fn=_collate_fn,
+        collate_fn=dataset._collate_fn,
         pin_memory=False,
         shuffle=shuffle,
     )
