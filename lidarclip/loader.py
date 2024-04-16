@@ -169,12 +169,12 @@ class NuscenesImageLidarDataset(Dataset):
 
 
 class OnceImageLidarDataset(Dataset):
-    def __init__(self, data_root: str, img_transform, split: str = "train"):
+    def __init__(self, data_root: str, img_transform, split: str = "train", enable_crop=False):
         super().__init__()
         self._data_root = join(data_root, "data")
         self._frames = self._setup(split)
         self._img_transform = img_transform
-        self.enable_crop = True
+        self.enable_crop = enable_crop
         gc.collect()
 
     def _setup(self, split: str) -> torch.Tensor:
@@ -269,7 +269,8 @@ class OnceImageLidarDataset(Dataset):
         random_box_2d = None
         if self.enable_crop:
             random_box_2d = self.get_random_box2d(sequence_id, frame_id, cam_name, og_size)
-            image = self.get_image_crop(image, random_box_2d)
+            if random_box_2d:
+                image = self.get_image_crop(image, random_box_2d)
 
         # image = to_pil_image(image)
 
@@ -299,7 +300,7 @@ class OnceImageLidarDataset(Dataset):
         # point_cloud = self._transform_lidar_to_cam(point_cloud, calib)
         # point_cloud = self._remove_points_outside_cam(point_cloud, og_size, new_size, calib)
 
-        if self.enable_crop:
+        if not self.enable_crop:
             point_cloud = self._transform_lidar_and_remove_points_outside_cam_torch(
                 point_cloud, calib, og_size, new_size
             )
@@ -308,7 +309,10 @@ class OnceImageLidarDataset(Dataset):
                 point_cloud, calib, og_size, new_size, random_box_2d
             )
 
-        return image, point_cloud if random_box_2d else None
+        if not self.enable_crop or random_box_2d:
+            return image, point_cloud
+        else:
+            return None
 
     def get_random_box2d(self, sequence_id, frame_id, cam_name, og_size):
         w_og, h_og = og_size
@@ -338,23 +342,21 @@ class OnceImageLidarDataset(Dataset):
         masked[ymin:ymax, xmin:xmax, :] = image_np[ymin:ymax, xmin:xmax, :]
         return Image.fromarray(masked)
 
-    def _collate_fn(self, batch, ignore_none=True):
+    def _collate_fn(self, batch):
         # There could be images which don't have valid detections;
         # The dataset returns None for these cases
         # The following code eliminates these None instances from the batch
-        if ignore_none:
-            len_batch = len(batch)
-            batch = list(filter(lambda x: x is not None, batch))
-            if len_batch > len(batch):
-                print("Removing Nones")
-                db_len = len(self)
-                diff = len_batch - len(batch)
-                while diff != 0:
-                    a = self[np.random.randint(0, db_len)]
-                    if a is None:
-                        continue
-                    batch.append(a)
-                    diff -= 1
+        len_batch = len(batch)
+        batch = list(filter(lambda x: x is not None, batch))
+        if len_batch > len(batch):
+            db_len = len(self)
+            diff = len_batch - len(batch)
+            while diff != 0:
+                a = self[np.random.randint(0, db_len)]
+                if a is None:
+                    continue
+                batch.append(a)
+                diff -= 1
         batched_img = default_collate([elem[0] for elem in batch])
         batched_pc = [elem[1] for elem in batch]
         return batched_img, batched_pc
@@ -663,12 +665,13 @@ def build_loader(
     num_workers=16,
     split="train",
     shuffle=False,
+    enable_crop=False,
     dataset_name="once",
     nuscenes_datadir=None,
     nuscenes_split="train",
 ):
     if dataset_name == "once":
-        dataset = OnceImageLidarDataset(datadir, img_transform=clip_preprocess, split=split)
+        dataset = OnceImageLidarDataset(datadir, img_transform=clip_preprocess, split=split, enable_crop=enable_crop)
     elif dataset_name == "nuscenes":
         dataset = NuscenesImageLidarDataset(datadir, img_transform=clip_preprocess, split=split)
     elif dataset_name == "joint":
@@ -682,11 +685,15 @@ def build_loader(
     else:
         raise ValueError("Unknown dataset {}".format(dataset_name))
 
+    collate_fn = _collate_fn
+    if enable_crop:
+        collate_fn=dataset._collate_fn
+
     loader = DataLoader(
         dataset,
         num_workers=num_workers,
         batch_size=batch_size,
-        collate_fn=dataset._collate_fn,
+        collate_fn=collate_fn,
         pin_memory=False,
         shuffle=shuffle,
     )
