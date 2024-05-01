@@ -1,0 +1,2 @@
+Experiment Name,Image Query Accuracy,Lidar Query Accuracy,Image Query Top-5 Accuracy,Lidar Query Top-5 Accuracy
+sim_best_e9,44.55604676549214,31.616789737379694,82.65116919092385,50.20080448441716

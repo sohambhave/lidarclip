@@ -1,0 +1,2 @@
+Experiment Name,Image Query Accuracy,Lidar Query Accuracy,Image Query Top-5 Accuracy,Lidar Query Top-5 Accuracy
+con_best_e9,53.1420034998392,55.089713682611304,89.01655005642688,61.76706966721868

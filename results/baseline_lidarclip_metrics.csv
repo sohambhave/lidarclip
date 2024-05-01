@@ -1,0 +1,2 @@
+Experiment Name,Image Query Accuracy,Lidar Query Accuracy,Image Query Top-5 Accuracy,Lidar Query Top-5 Accuracy
+baseline_lidarclip,11.409347063087555,8.45924018568782,38.94732154325309,33.65461890285752
