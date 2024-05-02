@@ -169,18 +169,22 @@ class NuscenesImageLidarDataset(Dataset):
 
 
 class OnceImageLidarDataset(Dataset):
-    def __init__(self, data_root: str, img_transform, split: str = "train", enable_crop=False):
+    def __init__(self, data_root: str, img_transform, split: str = "train", enable_crop=False, blackout_crop=False, min_image_det_area=0, min_3d_det_points=0):
         super().__init__()
-        self._data_root = join(data_root, "data")
-        self._frames = self._setup(split)
-        self._img_transform = img_transform
         self.enable_crop = enable_crop
+        self.blackout_crop = blackout_crop
+        self.min_2d_det_area = min_image_det_area
+        self.min_3d_det_points = min_3d_det_points
+        self._data_root = join(data_root, "data")
+        self._frames, self._frames_cam_idx = self._setup(split)
+        self._img_transform = img_transform
         gc.collect()
 
     def _setup(self, split: str) -> torch.Tensor:
         assert split in SPLITS, f"Unknown split: {split}, must be one of {SPLITS.keys()}"
 
         seq_list = set()
+        print(f"{SPLITS[split]=}")
         for attr in SPLITS[split]:
             seq_list_path = os.path.join(self._data_root, "..", "ImageSets", f"{attr}.txt")
             if not os.path.exists(seq_list_path):
@@ -199,6 +203,7 @@ class OnceImageLidarDataset(Dataset):
             self._idx_to_cam[i] = cam
 
         frames = []
+        frames_cam_idx = []
         self._cam_to_velos = torch.zeros((len(seq_list), len(CAM_NAMES), 4, 4))
         self._cam_intrinsics = torch.zeros((len(seq_list), len(CAM_NAMES), 3, 3))
         self._cam_distortions = torch.zeros((len(seq_list), len(CAM_NAMES), 5))
@@ -224,7 +229,12 @@ class OnceImageLidarDataset(Dataset):
                 if "annos" in frame_anno:  # Fetch boxes_2d and boxes_3d from annos
                     self._boxes_3d[(sequence_id, frame_id)] = frame_anno["annos"]["boxes_3d"]
                     for cam_name in CAM_NAMES:
-                        self._boxes_2d[(sequence_id, frame_id, cam_name)] = frame_anno["annos"]["boxes_2d"][cam_name]
+                        self._boxes_2d[(sequence_id, frame_id, cam_name)] = []
+                        for box2d in frame_anno["annos"]["boxes_2d"][cam_name]:
+                            if self.is_box_valid(box2d):
+                                self._boxes_2d[(sequence_id, frame_id, cam_name)].append(box2d)
+                        if len(self._boxes_2d[(sequence_id, frame_id, cam_name)]) > 0:
+                            frames_cam_idx.append((int(sequence_id), int(frame_id), int(self._cam_to_idx[cam_name])))
                 else: # Empty list if no annos found
                     self._boxes_3d[(sequence_id, frame_id)] = []
                     for cam_name in CAM_NAMES:
@@ -244,10 +254,24 @@ class OnceImageLidarDataset(Dataset):
                 )
 
         print(f"[Dataset] Found {len(frames)*len(CAM_NAMES)} frames.")
-        return torch.as_tensor(frames)
+        print(f"[Dataset] Found {len(frames_cam_idx)} valid frames.")
+        return torch.as_tensor(frames), torch.as_tensor(frames_cam_idx)
 
+    def is_box_valid(self, box_2d, og_size=(1920, 1020)):
+        w_og, h_og = og_size
+        left, right = w_og // 2 - h_og // 2, w_og // 2 + h_og // 2
+        top, bottom = 0, h_og
+        # Check if the box is in within the crop
+        is_box_in_crop = lambda box_2d: left <= box_2d[0] <= right and top <= box_2d[1] <= bottom and \
+                                        left <= box_2d[2] <= right and top <= box_2d[3] <= bottom
+        # Filter out tiny boxes
+        is_box_large_enough = lambda box_2d: (box_2d[2] - box_2d[0]) * (box_2d[3] - box_2d[1]) > self.min_2d_det_area
+        # Check if box is within FOV and within crop
+        return  all(coord > 0 for coord in box_2d) and is_box_in_crop(box_2d) and is_box_large_enough(box_2d)
+        
     def __len__(self):
-        return len(self._frames) * len(CAM_NAMES)
+        # return len(self._frames) * len(CAM_NAMES)
+        return len(self._frames_cam_idx)
 
     def __getitem__(self, index):
         """Load image and point cloud.
@@ -309,6 +333,9 @@ class OnceImageLidarDataset(Dataset):
                 point_cloud, calib, og_size, new_size, random_box_2d
             )
 
+        if point_cloud.shape[0] < self.min_3d_det_points:
+            return None
+
         if not self.enable_crop or random_box_2d:
             return image, point_cloud
         else:
@@ -322,8 +349,11 @@ class OnceImageLidarDataset(Dataset):
         # Check if the box is in within the crop
         is_box_in_crop = lambda box_2d: left <= box_2d[0] <= right and top <= box_2d[1] <= bottom and \
                                         left <= box_2d[2] <= right and top <= box_2d[3] <= bottom
+        # Filter out tiny boxes
+        is_box_large_enough = lambda box_2d: (box_2d[2] - box_2d[0]) * (box_2d[3] - box_2d[1]) > self.min_2d_det_area
         # Check if box is within FOV and within crop
-        is_box_valid = lambda box_2d: all(coord > 0 for coord in box_2d) and is_box_in_crop(box_2d)
+        is_box_valid = lambda box_2d: all(coord > 0 for coord in box_2d) and is_box_in_crop(box_2d) and is_box_large_enough(box_2d)
+        # is_box_valid = lambda box_2d: all(coord > 0 for coord in box_2d) and is_box_large_enough(box_2d)
         # Randomly return one of the detections; Return None if no detections found
         random_box_2d = None
         for i in range(len(self._boxes_2d[(sequence_id, frame_id, cam_name)])):
@@ -338,9 +368,12 @@ class OnceImageLidarDataset(Dataset):
         # Blacks out the image other than the cropped region
         image_np = np.array(image)
         xmin, ymin, xmax, ymax = int(box2d[0]), int(box2d[1]), int(box2d[2]), int(box2d[3])
-        masked = np.zeros_like(image_np, dtype=np.uint8)
-        masked[ymin:ymax, xmin:xmax, :] = image_np[ymin:ymax, xmin:xmax, :]
-        return Image.fromarray(masked)
+        if self.blackout_crop:
+            image_crop = np.zeros_like(image_np, dtype=np.uint8)
+            image_crop[ymin:ymax, xmin:xmax, :] = image_np[ymin:ymax, xmin:xmax, :]
+        else:
+            image_crop = image_np[ymin:ymax, xmin:xmax, :]
+        return Image.fromarray(image_crop)
 
     def _collate_fn(self, batch):
         # There could be images which don't have valid detections;
@@ -361,14 +394,22 @@ class OnceImageLidarDataset(Dataset):
         batched_pc = [elem[1] for elem in batch]
         return batched_img, batched_pc
 
+    # def map_index(self, index):
+    #     sequence_id, frame_id = self._frames[index // len(CAM_NAMES)]
+    #     cam_idx = index % len(CAM_NAMES)
+    #     sequence_id = str(sequence_id.item()).zfill(6)
+    #     seq_idx = self._sequence_map[sequence_id]
+
+    #     frame_id = str(frame_id.item())
+    #     cam_name = self._idx_to_cam[cam_idx]
+    #     return sequence_id, frame_id, cam_idx, seq_idx, cam_name
+
     def map_index(self, index):
-        sequence_id, frame_id = self._frames[index // len(CAM_NAMES)]
-        cam_idx = index % len(CAM_NAMES)
+        sequence_id, frame_id, cam_idx = self._frames_cam_idx[index]
         sequence_id = str(sequence_id.item()).zfill(6)
         seq_idx = self._sequence_map[sequence_id]
-
         frame_id = str(frame_id.item())
-        cam_name = self._idx_to_cam[cam_idx]
+        cam_name = self._idx_to_cam[cam_idx.item()]
         return sequence_id, frame_id, cam_idx, seq_idx, cam_name
 
     @staticmethod
@@ -431,7 +472,6 @@ class OnceImageLidarDataset(Dataset):
     def _transform_lidar_and_remove_points_outside_crop_torch(
             points_lidar, calibration, og_size, new_size, random_box_2d
     ):
-
         # project to cam coords
         cam_2_lidar = calibration["cam_to_velo"]
 
@@ -666,12 +706,17 @@ def build_loader(
     split="train",
     shuffle=False,
     enable_crop=False,
+    blackout_crop=False,
+    min_image_det_area=0, 
+    min_3d_det_points=0,
     dataset_name="once",
     nuscenes_datadir=None,
     nuscenes_split="train",
 ):
     if dataset_name == "once":
-        dataset = OnceImageLidarDataset(datadir, img_transform=clip_preprocess, split=split, enable_crop=enable_crop)
+        dataset = OnceImageLidarDataset(datadir, img_transform=clip_preprocess, split=split, 
+                                        enable_crop=enable_crop, blackout_crop=blackout_crop,
+                                        min_image_det_area=min_image_det_area, min_3d_det_points=min_3d_det_points)
     elif dataset_name == "nuscenes":
         dataset = NuscenesImageLidarDataset(datadir, img_transform=clip_preprocess, split=split)
     elif dataset_name == "joint":
